@@ -1,0 +1,8 @@
+.DS_Store
+.RData
+.Rhistory
+.Rproj.user/**
+omnipathr-log/**
+.Rproj.user
+data/**
+results/citosig_moon_activties.RData
