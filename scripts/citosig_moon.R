@@ -23,6 +23,10 @@ load("support/collectri.RData")
 # save(meta_network, file = "support/neta_network.RData")
 load("support/neta_network.RData")
 
+##let's try with an updatedo mnipath metaPKN
+# load("../meta_PKN_BIGG/results/meta_PKN.RData")
+# meta_network <- meta_PKN
+
 nodes <- unique(c(meta_network$source, meta_network$target))
 
 collectri <- collectri[collectri$source %in% nodes,]
@@ -269,13 +273,135 @@ moon_res_df_long_target_only_GPTcleanedup$quality <- ifelse(moon_res_df_long_tar
 quality_mapping <- unique(moon_res_df_long_target_only_GPTcleanedup[,c("source","quality")])
 quality_mapping <- quality_mapping[complete.cases(quality_mapping),]
 #we can also add some of the metadata as colors for example
-ggplot(moon_res_df_long_target_only_GPTcleanedup, aes(x = source, y = score, group = source, color = loghours, fill = loghours)) + 
+ggplot(moon_res_df_long_target_only_GPTcleanedup, aes(x = source, y = score, group = source, color = loghours, fill = platformType)) + 
   geom_boxplot(fill = quality_mapping$quality, coef = 6) + 
   geom_jitter() + 
   theme_minimal() +
   theme(axis.text.x=element_text(angle=45, hjust=1)) + geom_hline(yintercept = 0)
 
-cor.test(moon_res_df_long_target_only_GPTcleanedup$score, moon_res_df_long_target_only_GPTcleanedup$loghours)
+moon_res_df_long_target_only_GPTcleanedup <- moon_res_df_long_target_only_GPTcleanedup %>%
+  group_by(source) %>%
+  mutate(mean_ligand_score = mean(score, na.rm = TRUE)) %>%
+  ungroup()
+moon_res_df_long_target_only_GPTcleanedup <- as.data.frame(moon_res_df_long_target_only_GPTcleanedup)
+
+sum(unique(moon_res_df_long_target_only_GPTcleanedup$mean_ligand_score) > 0)
+sum(unique(moon_res_df_long_target_only_GPTcleanedup$mean_ligand_score) < 0)
+
+moon_res_df_long_target_only_GPTcleanedup <- moon_res_df_long_target_only_GPTcleanedup %>%
+  group_by(source) %>%
+  mutate(sd_ligand_score = sd(score, na.rm = TRUE)) %>%
+  ungroup()
+moon_res_df_long_target_only_GPTcleanedup <- as.data.frame(moon_res_df_long_target_only_GPTcleanedup)
+
+
+#get the levels of the ligands
+moon_level_list_filtered <- lapply(moon_res_list, function(x){
+  sample <- names(x)[2]
+  x <- x[which(x$level != 0),c(4,3)]
+  x <- unique(x)
+  names(x)[2] <- sample
+return(x)})
+
+moon_level_df <- moon_level_list_filtered %>% reduce(full_join, by = "source_original")
+moon_level_df <- as.data.frame(moon_level_df)
+
+moon_level_df_long <- melt(moon_level_df)
+moon_level_df_long$target <- gsub("@.*","",moon_level_df_long$variable)
+
+moon_level_df_long$target <- sapply(moon_level_df_long$target, function(x, maping_vector){
+  return(maping_vector[x])
+},maping_vector = maping_vector)
+
+moon_level_df_long <- moon_level_df_long[,c(2,1,3,4)]
+
+names(moon_level_df_long) <- c("id", "source", "level", "target")
+moon_level_df_long$id <- as.character(moon_level_df_long$id)
+
+moon_level_df_long_reduced <- moon_level_df_long[which(moon_level_df_long$source %in% moon_res_df_long_target_only_GPTcleanedup$source),]
+
+moon_res_df_long_target_only_GPTcleanedup_level <- merge(moon_res_df_long_target_only_GPTcleanedup, moon_level_df_long_reduced, by = c("id","source","target"))
+moon_res_df_long_target_only_GPTcleanedup_level$level <- as.character(moon_res_df_long_target_only_GPTcleanedup_level$level)
+
+#for paper
+ggplot(moon_res_df_long_target_only_GPTcleanedup_level, aes(x = source, y = score, group = source, color = level)) + 
+  geom_boxplot(fill = quality_mapping$quality, coef = 6, color = "black", alpha = 1) + 
+  geom_jitter() + 
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) + geom_hline(yintercept = 0)
+
+
+ggplot(moon_res_df_long_target_only_GPTcleanedup_level, aes(x = level, y = score)) + 
+  geom_boxplot(coef = 7) + geom_jitter(alpha = 0.3) + theme_minimal()
+
+for(level in unique(moon_res_df_long_target_only_GPTcleanedup_level$level))
+{
+  print(paste("level: ",level, sep = ""))
+  print(mean(moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$level == level, "score"]))
+  print(median(moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$level == level, "score"]))
+  print(sd(moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$level == level, "score"]))
+  print(length(moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$level == level, "score"]))
+}
+
+cor.test(moon_res_df_long_target_only_GPTcleanedup_level$score, as.numeric(moon_res_df_long_target_only_GPTcleanedup_level$level), method = "kendall")
+
+moon_res_df_ranks <- moon_res_df
+moon_res_df_ranks[,-1] <- as.data.frame(apply(moon_res_df_ranks[,-1], 2, function(x){rank(as.numeric(x), na.last = "keep") / length(na.omit(x))}))
+##IFNA1
+ligand_to_rank <- "WNT3A"
+ligand_to_rank_samples <- moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$source == ligand_to_rank,"id"]
+
+mean(moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$target == ligand_to_rank,"score"])
+mean(as.numeric(moon_res_df[moon_res_df$source_original == ligand_to_rank,which(names(moon_res_df) %in% ligand_to_rank_samples)]), na.rm = T)
+mean(as.numeric(moon_res_df[moon_res_df$source_original == ligand_to_rank,-c(1,which(names(moon_res_df) %in% ligand_to_rank_samples))]), na.rm = T)
+plot(density(as.numeric(moon_res_df[moon_res_df$source_original == ligand_to_rank,-c(1,which(names(moon_res_df) %in% ligand_to_rank_samples))]), na.rm = T))
+#get the relative rank
+mean(as.numeric(moon_res_df_ranks[moon_res_df_ranks$source_original == ligand_to_rank,-c(1,which(names(moon_res_df_ranks) %in% ligand_to_rank_samples))]), na.rm = T)
+mean(as.numeric(moon_res_df_ranks[moon_res_df_ranks$source_original == ligand_to_rank,which(names(moon_res_df_ranks) %in% ligand_to_rank_samples)]), na.rm = T)
+
+##all ligands
+ligand_scores_benchamrk <- list()
+for(ligand_to_rank in unique(moon_res_df_long_target_only_GPTcleanedup_level$target))
+{
+  print(ligand_to_rank)
+  ligand_to_rank_samples <- moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$source == ligand_to_rank,"id"]
+  mean_quantile_in_trueExp <- mean(as.numeric(moon_res_df_ranks[moon_res_df_ranks$source_original == ligand_to_rank,which(names(moon_res_df_ranks) %in% ligand_to_rank_samples)]), na.rm = T)
+  mean_quantile_in_falseExp <- mean(as.numeric(moon_res_df_ranks[moon_res_df_ranks$source_original == ligand_to_rank,-c(1,which(names(moon_res_df_ranks) %in% ligand_to_rank_samples))]), na.rm = T)
+  mean_score_in_trueExp <- mean(as.numeric(moon_res_df[moon_res_df$source_original == ligand_to_rank,which(names(moon_res_df) %in% ligand_to_rank_samples)]), na.rm = T)
+  mean_score_in_falseExp <- mean(as.numeric(moon_res_df[moon_res_df$source_original == ligand_to_rank,-c(1,which(names(moon_res_df) %in% ligand_to_rank_samples))]), na.rm = T)
+  ligand_scores_benchamrk[[ligand_to_rank]] <- c(ligand_to_rank, mean_quantile_in_trueExp, mean_quantile_in_falseExp, mean_score_in_trueExp, mean_score_in_falseExp)
+}
+
+ligand_scores_benchamrk_df <- as.data.frame(do.call(rbind, ligand_scores_benchamrk))
+ligand_scores_benchamrk_df[,-1] <- as.data.frame(apply(ligand_scores_benchamrk_df[,-1], 2, as.numeric))
+names(ligand_scores_benchamrk_df) <- c("ligand_to_rank", "mean_quantile_in_trueExp", "mean_quantile_in_falseExp", "mean_score_in_trueExp", "mean_score_in_falseExp")
+
+ggplot(ligand_scores_benchamrk_df, aes(x = mean_quantile_in_falseExp, y = mean_quantile_in_trueExp)) + geom_point() + theme_minimal() + ylim(c(0,1)) + xlim(c(0,1)) + geom_abline(intercept = 0)
+sum(ligand_scores_benchamrk_df$mean_quantile_in_trueExp > ligand_scores_benchamrk_df$mean_quantile_in_falseExp)
+
+ligand_quantiles_long <- melt(ligand_scores_benchamrk_df[order(ligand_scores_benchamrk_df[,2],decreasing = F),c(1,2,3)])
+ligand_quantiles_long$ligand_to_rank <- factor(ligand_quantiles_long$ligand_to_rank, levels = unique(ligand_quantiles_long$ligand_to_rank))
+
+#good sup figure
+ggplot(ligand_quantiles_long, aes(x = value, y = ligand_to_rank, color = variable)) + geom_point(size = 3) + theme_minimal()
+
+ligand_score_long <- melt(ligand_scores_benchamrk_df[order(ligand_scores_benchamrk_df[,4],decreasing = F),c(1,4,5)])
+ligand_score_long$ligand_to_rank <- factor(ligand_score_long$ligand_to_rank, levels = unique(ligand_score_long$ligand_to_rank))
+
+ggplot(ligand_score_long, aes(x = value, y = ligand_to_rank, color = variable)) + geom_point(size = 3) + theme_minimal()
+
+#just chekc if platform or other variable has higher scores
+variable_regulon <- moon_res_df_long_target_only_GPTcleanedup[,c(1,9)]
+variable_regulon$mor <- 1
+names(variable_regulon) <- c("target","source","mor")
+measurments_variable <- moon_res_df_long_target_only_GPTcleanedup[,c(3),drop = F]
+row.names(measurments_variable) <- moon_res_df_long_target_only_GPTcleanedup$id
+result_ulm <- run_ulm(as.matrix(measurments_variable), variable_regulon, minsize = 1)
+# mean(moon_res_df_long_target_only_GPTcleanedup[moon_res_df_long_target_only_GPTcleanedup$platformType == "MicroArray",3])
+# mean(moon_res_df_long_target_only_GPTcleanedup[moon_res_df_long_target_only_GPTcleanedup$platformType == "RNASeq",3])
+
+
+cor.test(moon_res_df_long_target_only_GPTcleanedup$score, moon_res_df_long_target_only_GPTcleanedup$loghours, method = "kendall")
 ggplot(moon_res_df_long_target_only_GPTcleanedup, aes(x = loghours, y = score)) + geom_jitter() +
   geom_smooth(method='lm', formula= y~x) + theme_minimal() + geom_hline(yintercept = 0)
 
