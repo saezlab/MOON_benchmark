@@ -24,8 +24,7 @@ load("support/collectri.RData")
 load("support/neta_network.RData")
 
 ##let's try with an updatedo mnipath metaPKN
-# load("../meta_PKN_BIGG/results/meta_PKN.RData")
-# meta_network <- meta_PKN
+# load("support/meta_network_20240319.RData")
 
 nodes <- unique(c(meta_network$source, meta_network$target))
 
@@ -63,51 +62,51 @@ n_steps <- 10
 #   RNA_input <- zscores[,exp_counter]
 #   names(RNA_input) <- row.names(zscores)
 #   RNA_input <- RNA_input[-which(is.na(RNA_input))]
-#   
+# 
 #   meta_network_filtered <- meta_network_cleanup(meta_network)
 #   meta_network_filtered <- cosmosR:::filter_pkn_expressed_genes(names(RNA_input), meta_pkn = meta_network_filtered)
-#   
+# 
 #   TF_input <- TF_activities_df[,exp_counter+1]
 #   names(TF_input) <- TF_activities_df[,1]
-#   
+# 
 #   if(sum(is.na(TF_input)) > 0)
 #   {
 #     TF_input <- TF_input[-which(is.na(TF_input))]
 #   }
 #   TF_input_filtered <- cosmosR:::filter_input_nodes_not_in_pkn(TF_input, meta_network_filtered)
 #   meta_network_filtered <- cosmosR:::keep_observable_neighbours(meta_network_filtered, n_steps = 10, observed_nodes = names(TF_input_filtered))
-#   
+# 
 #   meta_network_compressed_list <- compress_same_children(meta_network_filtered, sig_input = c(0),metab_input = TF_input_filtered)
-#   
+# 
 #   meta_network_compressed <- meta_network_compressed_list$compressed_network
-#   
+# 
 #   node_signatures <- meta_network_compressed_list$node_signatures
-#   
+# 
 #   duplicated_parents <- meta_network_compressed_list$duplicated_signatures
-#   
+# 
 #   meta_network_compressed <- meta_network_cleanup(meta_network_compressed)
-#   
+# 
 #   # test <- decoupleRnival(downstream_input = decoupleRnival_input, meta_network = meta_network_compressed, n_layers = 3, statistic = "ulm")
-#   
+# 
 #   meta_network_compressed_to_run <- meta_network_compressed
-#   
+# 
 #   #We run moon in a loop until TF-target coherence convergences
 #   before <- 1
 #   after <- 0
 #   i <- 1
 #   while (before != after & i < 10) {
 #     before <- length(meta_network_compressed_to_run[,1])
-#     moon_res <- cosmosR::moon(downstream_input = TF_input_filtered, 
-#                               meta_network = meta_network_compressed_to_run, 
-#                               n_layers = n_steps, 
-#                               statistic = "ulm") 
-#     
+#     moon_res <- cosmosR::moon(downstream_input = TF_input_filtered,
+#                               meta_network = meta_network_compressed_to_run,
+#                               n_layers = n_steps,
+#                               statistic = "ulm")
+# 
 #     meta_network_compressed_to_run <- filter_incohrent_TF_target(moon_res, collectri, meta_network_compressed_to_run, RNA_input)
-#     
+# 
 #     after <- length(meta_network_compressed_to_run[,1])
 #     i <- i + 1
 #   }
-#   
+# 
 #   if(i < 10)
 #   {
 #     print(paste("Converged after ",paste(i-1," iterations", sep = ""),sep = ""))
@@ -115,14 +114,14 @@ n_steps <- 10
 #   {
 #     print(paste("Interupted after ",paste(i," iterations. Convergence uncertain.", sep = ""),sep = ""))
 #   }
-#   
+# 
 #   moon_res <- decompress_moon_result(moon_res, meta_network_compressed_list, meta_network_compressed_to_run)
 #   names(moon_res)[2] <- names(TF_activities_df)[exp_counter+1]
-#   
+# 
 #   moon_res_list[[exp_counter]] <- moon_res
 # }
 # 
-# save(moon_res_list, file = "results/citosig_moon_activties.RData")
+# save(moon_res_list, file = "results/citosig_moon_activties_20240319.RData")
 load("results/citosig_moon_activties.RData")
 
 moon_res_list_filtered <- lapply(moon_res_list, function(x){x <- x[which(x$level != 0),c(4,2)]
