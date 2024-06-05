@@ -7,6 +7,7 @@ library(dplyr)
 library(ggplot2)
 library(yardstick)
 library(ggrepel)
+library(ggExtra)
 
 source("scripts/support_functions.R")
 
@@ -378,15 +379,15 @@ names(ligand_scores_benchamrk_df) <- c("ligand_to_rank", "mean_quantile_in_trueE
 ggplot(ligand_scores_benchamrk_df, aes(x = mean_quantile_in_falseExp, y = mean_quantile_in_trueExp)) + geom_point() + theme_minimal() + ylim(c(0,1)) + xlim(c(0,1)) + geom_abline(intercept = 0)
 sum(ligand_scores_benchamrk_df$mean_quantile_in_trueExp > ligand_scores_benchamrk_df$mean_quantile_in_falseExp)
 
-ligand_quantiles_long <- melt(ligand_scores_benchamrk_df[order(ligand_scores_benchamrk_df[,2],decreasing = F),c(1,2,3)])
+#ordered by scores
+ligand_quantiles_long <- melt(ligand_scores_benchamrk_df[order(ligand_scores_benchamrk_df[,4],decreasing = F),c(1,2,3)])
 ligand_quantiles_long$ligand_to_rank <- factor(ligand_quantiles_long$ligand_to_rank, levels = unique(ligand_quantiles_long$ligand_to_rank))
-
-#good sup figure
-ggplot(ligand_quantiles_long, aes(x = value, y = ligand_to_rank, color = variable)) + geom_point(size = 3) + theme_minimal()
 
 ligand_score_long <- melt(ligand_scores_benchamrk_df[order(ligand_scores_benchamrk_df[,4],decreasing = F),c(1,4,5)])
 ligand_score_long$ligand_to_rank <- factor(ligand_score_long$ligand_to_rank, levels = unique(ligand_score_long$ligand_to_rank))
 
+#good sup figure
+ggplot(ligand_quantiles_long, aes(x = value, y = ligand_to_rank, color = variable)) + geom_point(size = 3) + theme_minimal()
 ggplot(ligand_score_long, aes(x = value, y = ligand_to_rank, color = variable)) + geom_point(size = 3) + theme_minimal()
 
 #just chekc if platform or other variable has higher scores
@@ -459,6 +460,94 @@ names(moon_scoring_network$ATT)[2] <- "moon_score"
 write_csv(moon_scoring_network$SIF, file = "results/networktest_SIF.csv")
 write_csv(moon_scoring_network$ATT, file = "results/networktest_ATT.csv")
 
+##generate al scoring networks in a loop
+experiments <- moon_res_df_long_target_only_GPTcleanedup_level[!duplicated(moon_res_df_long_target_only_GPTcleanedup_level$source),"id"]
+
+# moon_scoring_network_list <- list()
+# moon_scoring_network_nedges <- list()
+# moon_scoring_network_nnodes <- list()
+# moon_scoring_network_nTFs <- list()
+# for(i in 1:length(experiments))
+# {
+#   print(i)
+#   experiment_id <- experiments[i]
+#   expressed_genes <- zscores[,experiment_id,drop = F]
+#   expressed_genes <- expressed_genes[complete.cases(expressed_genes),,drop = F]
+#   expressed_genes <- setNames(expressed_genes[,1], nm = row.names(expressed_genes))
+#   
+#   moon_res_list_named <- moon_res_list
+#   names(moon_res_list_named) <- lapply(moon_res_list_named, function(x){return(names(x)[2])})
+#   
+#   moon_res_experiment <- moon_res_list_named[[experiment_id]] 
+#   moon_res_experiment <- moon_res_experiment[,c(4,2,3)]
+#   names(moon_res_experiment)[1] <- "source"
+#   
+#   ligand <- as.character(
+#     moon_res_df_long_target_only_GPTcleanedup[moon_res_df_long_target_only_GPTcleanedup$id == experiment_id,"source"])
+#   
+#   n_steps <- moon_res_experiment[moon_res_experiment$source == ligand,"level"]
+#   
+#   meta_network_filtered <- cosmosR:::filter_pkn_expressed_genes(expressed_genes_entrez = names(expressed_genes), meta_network)
+#   
+#   #This function allow us to get the subnetowrk that yielded the ligand score
+#   moon_scoring_network <- get_moon_scoring_network(ligand, meta_network_filtered, moon_res_experiment, keep_upstream_node_peers = F)
+#   
+#   names(moon_scoring_network$SIF)[2] <- "sign"
+#   names(moon_scoring_network$ATT)[2] <- "moon_score"
+#   moon_scoring_network_list[[i]] <- moon_scoring_network
+#   
+#   SIF <- moon_scoring_network$SIF
+#   ATT <- moon_scoring_network$ATT
+#   
+#   moon_scoring_network_nedges[[i]] <- length(SIF[,1])
+#   moon_scoring_network_nnodes[[i]] <- length(ATT[,1])
+#   moon_scoring_network_nTFs[[i]] <- length(ATT[ATT$source %in% collectri$source,1])
+# }
+# 
+# moon_scoring_network_characteristics <- list("networks" = moon_scoring_network_list,
+#                                              "nedges" = moon_scoring_network_nedges,
+#                                              "nnodes" = moon_scoring_network_nnodes,
+#                                              "nTFs" = moon_scoring_network_nTFs)
+# 
+# save(moon_scoring_network_characteristics, file = "results/moon_scoring_network_characteristics.RData")
+load("results/moon_scoring_network_characteristics.RData")
+moon_scoring_network_list <- moon_scoring_network_characteristics$networks
+moon_scoring_network_nedges <- moon_scoring_network_characteristics$nedges
+moon_scoring_network_nnodes <- moon_scoring_network_characteristics$nnodes
+moon_scoring_network_nTFs <- moon_scoring_network_characteristics$nTFs
+
+boxplot(unlist(moon_scoring_network_nedges))
+quantile(unlist(moon_scoring_network_nedges), 0.5)
+
+boxplot(unlist(moon_scoring_network_nnodes))
+quantile(unlist(moon_scoring_network_nnodes), 0.5)
+
+boxplot(unlist(moon_scoring_network_nTFs))
+quantile(unlist(moon_scoring_network_nTFs), 0.5)
+mean(unlist(moon_scoring_network_nTFs))
+
+
+df <- as.data.frame(sapply(moon_scoring_network_characteristics[-1], unlist))
+df_long <- melt(df)
+
+ggplot(df_long, aes(x = variable, y = value)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+  geom_jitter(width = 0.2, height = 0, alpha = 0.5) +
+  facet_wrap(~variable, scales = "free", nrow = 1) +
+  theme_minimal() +
+  labs(title = "Moon scoring network characteristics",
+       x = "Variables",
+       y = "Values")
+
+# Scatter plot using ggplot2
+p <- ggplot(df, aes(x = nedges, y = nnodes, size = nTFs/10)) +
+  geom_point(alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Moon scoring network characteristics")
+
+# Add marginal distributions
+p_with_marginals <- ggMarginal(p, type = "density", fill = "lightgrey")
+print(p_with_marginals)
 
 #let's plot only ligand with experiements under 24h
 # ggplot(moon_res_df_long_target_only_GPTcleanedup[moon_res_df_long_target_only_GPTcleanedup$inferred_time_all_conditions <= 24,], aes(x = source, y = score, group = source)) + 
