@@ -1,9 +1,10 @@
 .DS_Store
 .RData
 .Rhistory
+Rplots.pdf
 .Rproj.user/**
 omnipathr-log/**
 .Rproj.user
-data/**
-results/citosig_moon_activties.RData
-results/citosig_moon_activties_20240319.RData
+data/
+2024.07.15.603538v3.full.pdf
+results/citosig_moon_*.RData

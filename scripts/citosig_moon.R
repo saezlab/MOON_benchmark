@@ -1,595 +1,787 @@
-library(readr)
-library(cosmosR)
-library(decoupleR)
-library(reshape2)
-library(purrr)
-library(dplyr)
-library(ggplot2)
-library(yardstick)
-library(ggrepel)
-library(ggExtra)
+# CytoSig MOON benchmark
+#
+# Manuscript section 2.2 / Figure 2.
+#
+# Default behavior intentionally uses the original MOON cache that was used for
+# the submitted manuscript figures. The 2024-03-19 rerun is kept as a transparent
+# network-correction comparison, but it is not mixed into the frozen paper
+# figures unless explicitly selected.
+#
+# Fast paper reproduction:
+#   Rscript scripts/citosig_moon.R
+#
+# Useful environment switches:
+#   CITOSIG_SNAPSHOT=paper_original              # default
+#   CITOSIG_SNAPSHOT=corrected_20240319          # use corrected rerun for plots
+#   CITOSIG_WRITE_FIGURES=false                  # build objects without writing PDFs
+#   CITOSIG_COMPARE_CORRECTED=true               # summarize original vs corrected
+#   CITOSIG_EXPORT_PANEL_D_NETWORKS=true         # export SIF/ATT files for examples
+#   CITOSIG_RECOMPUTE_TF=true                    # expensive, off by default
+#   CITOSIG_RECOMPUTE_MOON=true                  # very expensive, off by default
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(purrr)
+  library(reshape2)
+  library(ggplot2)
+  library(ggrepel)
+  library(ggExtra)
+  library(cosmosR)
+  library(decoupleR)
+})
 
 source("scripts/support_functions.R")
 
-zscores <- as.data.frame(
-  read_csv(file = "data/cytosig/zscore_final_clean_filtered.csv"))
-meta_data <- as.data.frame(
-  read_csv(file = "data/cytosig/zscore_meta_clean_renamed.csv"))
 
-# collectri <- decoupleR::get_collectri()
-# save(collectri, file = "support/collectri.RData")
-load("support/collectri.RData")
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
 
-# data("meta_network")
-# save(meta_network, file = "support/neta_network.RData")
-load("support/neta_network.RData")
+env_flag <- function(name, default = FALSE) {
+  value <- Sys.getenv(name, unset = NA_character_)
 
-##let's try with an updatedo mnipath metaPKN
-# load("support/meta_network_20240319.RData")
+  if (is.na(value) || value == "") {
+    return(default)
+  }
 
-nodes <- unique(c(meta_network$source, meta_network$target))
+  tolower(value) %in% c("1", "true", "t", "yes", "y")
+}
 
-collectri <- collectri[collectri$source %in% nodes,]
+load_single_rdata_object <- function(path) {
+  env <- new.env(parent = emptyenv())
+  object_names <- load(path, envir = env)
 
-row.names(zscores) <- zscores$gene
-zscores <- zscores[,-1]
+  if (length(object_names) != 1) {
+    stop("Expected exactly one object in ", path, ", found: ",
+         paste(object_names, collapse = ", "))
+  }
 
-collectri <- collectri[collectri$target %in% row.names(zscores),]
+  env[[object_names]]
+}
 
-#run this chunk to re-estimate the TF activties
-# TF_activities <- apply(zscores,2,function(x, collectri){
-#   TF_act <- decoupleR::run_ulm(na.omit(x), network = collectri)
-#   return(TF_act[,c(2,4)])
-# },collectri = collectri)
-# 
-# for(i in 1:length(TF_activities))
-# {
-#   names(TF_activities[[i]])[2] <- names(TF_activities)[i]
-# }
-# 
-# save(TF_activities, file = "results/citosig_TF_activties.RData")
-load("results/citosig_TF_activties.RData")
+SNAPSHOTS <- list(
+  paper_original = list(
+    label = "paper_original",
+    description = "Frozen manuscript snapshot using the original COSMOS PKN.",
+    moon_cache = "results/citosig_moon_activties.RData",
+    ligand_table = "results/moon_res_df_long_target_only_GPTcleanedup_withMeanScore.csv",
+    ligand_summary_col = "median_score_by_target",
+    meta_network = "support/neta_network.RData",
+    scoring_network_characteristics = "results/moon_scoring_network_characteristics.RData"
+  ),
+  corrected_20240319 = list(
+    label = "corrected_20240319",
+    description = "Transparency rerun using the 2024-03-19 COSMOS/Omnipath PKN.",
+    moon_cache = "results/citosig_moon_activties_20240319.RData",
+    ligand_table = "results/moon_res_df_long_target_only_20240319.csv",
+    ligand_summary_col = "mean_ligand_score",
+    meta_network = "support/meta_network_20240319.RData",
+    scoring_network_characteristics = NA_character_
+  )
+)
 
-TF_activities_df <- TF_activities %>% reduce(full_join, by = "source")
-TF_activities_df <- as.data.frame(TF_activities_df)
+SNAPSHOT_NAME <- Sys.getenv("CITOSIG_SNAPSHOT", unset = "paper_original")
+if (!SNAPSHOT_NAME %in% names(SNAPSHOTS)) {
+  stop("Unknown CITOSIG_SNAPSHOT='", SNAPSHOT_NAME, "'. Available snapshots: ",
+       paste(names(SNAPSHOTS), collapse = ", "))
+}
 
-n_steps <- 10
+SNAPSHOT <- SNAPSHOTS[[SNAPSHOT_NAME]]
+WRITE_FIGURES <- env_flag("CITOSIG_WRITE_FIGURES", default = TRUE)
+COMPARE_CORRECTED <- env_flag("CITOSIG_COMPARE_CORRECTED", default = FALSE)
+EXPORT_PANEL_D_NETWORKS <- env_flag("CITOSIG_EXPORT_PANEL_D_NETWORKS", default = FALSE)
+RECOMPUTE_TF <- env_flag("CITOSIG_RECOMPUTE_TF", default = FALSE)
+RECOMPUTE_MOON <- env_flag("CITOSIG_RECOMPUTE_MOON", default = FALSE)
+RECOMPUTE_SCORING_NETWORKS <- env_flag("CITOSIG_RECOMPUTE_SCORING_NETWORKS", default = FALSE)
 
-#run this chunl to re-estimate the moon scores
-# moon_res_list <- list()
-# for(exp_counter in 1:length(zscores[1,]))
-# {
-#   print(exp_counter)
-#   RNA_input <- zscores[,exp_counter]
-#   names(RNA_input) <- row.names(zscores)
-#   RNA_input <- RNA_input[-which(is.na(RNA_input))]
-# 
-#   meta_network_filtered <- meta_network_cleanup(meta_network)
-#   meta_network_filtered <- cosmosR:::filter_pkn_expressed_genes(names(RNA_input), meta_pkn = meta_network_filtered)
-# 
-#   TF_input <- TF_activities_df[,exp_counter+1]
-#   names(TF_input) <- TF_activities_df[,1]
-# 
-#   if(sum(is.na(TF_input)) > 0)
-#   {
-#     TF_input <- TF_input[-which(is.na(TF_input))]
-#   }
-#   TF_input_filtered <- cosmosR:::filter_input_nodes_not_in_pkn(TF_input, meta_network_filtered)
-#   meta_network_filtered <- cosmosR:::keep_observable_neighbours(meta_network_filtered, n_steps = 10, observed_nodes = names(TF_input_filtered))
-# 
-#   meta_network_compressed_list <- compress_same_children(meta_network_filtered, sig_input = c(0),metab_input = TF_input_filtered)
-# 
-#   meta_network_compressed <- meta_network_compressed_list$compressed_network
-# 
-#   node_signatures <- meta_network_compressed_list$node_signatures
-# 
-#   duplicated_parents <- meta_network_compressed_list$duplicated_signatures
-# 
-#   meta_network_compressed <- meta_network_cleanup(meta_network_compressed)
-# 
-#   # test <- decoupleRnival(downstream_input = decoupleRnival_input, meta_network = meta_network_compressed, n_layers = 3, statistic = "ulm")
-# 
-#   meta_network_compressed_to_run <- meta_network_compressed
-# 
-#   #We run moon in a loop until TF-target coherence convergences
-#   before <- 1
-#   after <- 0
-#   i <- 1
-#   while (before != after & i < 10) {
-#     before <- length(meta_network_compressed_to_run[,1])
-#     moon_res <- cosmosR::moon(downstream_input = TF_input_filtered,
-#                               meta_network = meta_network_compressed_to_run,
-#                               n_layers = n_steps,
-#                               statistic = "ulm")
-# 
-#     meta_network_compressed_to_run <- filter_incohrent_TF_target(moon_res, collectri, meta_network_compressed_to_run, RNA_input)
-# 
-#     after <- length(meta_network_compressed_to_run[,1])
-#     i <- i + 1
-#   }
-# 
-#   if(i < 10)
-#   {
-#     print(paste("Converged after ",paste(i-1," iterations", sep = ""),sep = ""))
-#   } else
-#   {
-#     print(paste("Interupted after ",paste(i," iterations. Convergence uncertain.", sep = ""),sep = ""))
-#   }
-# 
-#   moon_res <- decompress_moon_result(moon_res, meta_network_compressed_list, meta_network_compressed_to_run)
-#   names(moon_res)[2] <- names(TF_activities_df)[exp_counter+1]
-# 
-#   moon_res_list[[exp_counter]] <- moon_res
-# }
-# 
-# save(moon_res_list, file = "results/citosig_moon_activties_20240319.RData")
-load("results/citosig_moon_activties.RData")
+FIGURE_DIR <- if (SNAPSHOT_NAME == "paper_original") {
+  "results/figures"
+} else {
+  file.path("results/figures", SNAPSHOT$label)
+}
+dir.create(FIGURE_DIR, recursive = TRUE, showWarnings = FALSE)
 
-moon_res_list_filtered <- lapply(moon_res_list, function(x){x <- x[which(x$level != 0),c(4,2)]
-x <- unique(x)
-return(x)})
+message("Using CytoSig MOON snapshot: ", SNAPSHOT$label)
+message(SNAPSHOT$description)
+message("Full MOON recomputation enabled: ", RECOMPUTE_MOON)
 
-moon_res_df <- moon_res_list_filtered %>% reduce(full_join, by = "source_original")
-moon_res_df <- as.data.frame(moon_res_df)
 
-moon_res_df_long <- melt(moon_res_df)
-moon_res_df_long$target <- gsub("@.*","",moon_res_df_long$variable)
+# ------------------------------------------------------------------------------
+# Manuscript figure map
+# ------------------------------------------------------------------------------
+#
+# Figure 2A:
+#   MOON score of each applied ligand in its matching CytoSig experiment.
+#   Output: results/figures/moon_scores_ranked.pdf
+#
+# Figure 2B:
+#   Mean within-experiment quantile and mean raw score of each ligand in
+#   experiments where it was applied versus experiments where it was not applied.
+#   Outputs:
+#     results/figures/ligand_quantiles_long.pdf
+#     results/figures/ligand_score_long.pdf
+#
+# Figure 2C:
+#   Number of edges, nodes, and TFs in the MOON scoring networks.
+#   Outputs:
+#     results/figures/moon_scoring_network_characteristics.pdf
+#     results/figures/moon_scoring_network_characteristics_scatter.pdf
+#
+# Figure 2D:
+#   Network schematics assembled outside this script from exported SIF/ATT files
+#   and the Cytoscape session. Set CITOSIG_EXPORT_PANEL_D_NETWORKS=true to export
+#   example scoring networks without rerunning MOON.
 
-meta_data$targets <- gsub("[@&].*","",meta_data$id)
-targets <- unique(meta_data[,c(12,7)])
-maping_vector <- setNames(targets$treatment, nm = targets$targets)
 
-moon_res_df_long$target <- sapply(moon_res_df_long$target, function(x, maping_vector){
-  return(maping_vector[x])
-},maping_vector = maping_vector)
+# ------------------------------------------------------------------------------
+# Shared data loaders
+# ------------------------------------------------------------------------------
 
-moon_res_df_long <- moon_res_df_long[,c(2,1,3,4)]
+read_cytosig_metadata <- function(path = "data/cytosig/zscore_meta_clean_renamed.csv") {
+  metadata <- as.data.frame(readr::read_csv(path, show_col_types = FALSE))
+  metadata$experiment_target <- sub("[@&].*", "", metadata$id)
+  metadata
+}
 
-names(moon_res_df_long) <- c("id", "source", "score", "target")
-moon_res_df_long$id <- as.character(moon_res_df_long$id)
+read_zscore_matrix <- function(path = "data/cytosig/zscore_final_clean_filtered.csv") {
+  zscores <- as.data.frame(readr::read_csv(path, show_col_types = FALSE))
+  row.names(zscores) <- zscores$gene
+  zscores[, setdiff(names(zscores), "gene"), drop = FALSE]
+}
 
-roc <- decoupleRBench::calc_curve(moon_res_df_long)
+load_collectri <- function(path = "support/collectri.RData") {
+  load_single_rdata_object(path)
+}
 
-ggplot(roc, aes(x = 1-specificity,
-                y = sensitivity)) +
-  geom_line() +
-  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
-  xlab("FPR (1-specificity)") +
-  ylab("TPR (sensitivity)")
+load_meta_network <- function(path = SNAPSHOT$meta_network) {
+  meta_network <- load_single_rdata_object(path)
+  names(meta_network) <- c("source", "interaction", "target")
+  meta_network
+}
 
-moon_res_df_long_yarstick <- moon_res_df_long
-moon_res_df_long_yarstick$groundtruth <- as.numeric(moon_res_df_long_yarstick$source == moon_res_df_long_yarstick$target)
-bad_experiments <- moon_res_df_long_yarstick[moon_res_df_long_yarstick$groundtruth & is.na(moon_res_df_long_yarstick$score),"id"]
-bad_experiments <- unique(bad_experiments)
-moon_res_df_long_yarstick <- moon_res_df_long_yarstick[!(moon_res_df_long_yarstick$id %in% bad_experiments),]
+load_moon_cache <- function(path = SNAPSHOT$moon_cache) {
+  moon_res_list <- load_single_rdata_object(path)
 
-moon_res_df_long_yarstick$groundtruth <- factor(moon_res_df_long_yarstick$groundtruth, levels = c(1,0))
-moon_res_df_long_yarstick <- moon_res_df_long_yarstick[complete.cases(moon_res_df_long_yarstick),]
+  if (!is.list(moon_res_list)) {
+    stop("Expected moon cache to contain a list: ", path)
+  }
 
-ligands <- unique(moon_res_df_long_yarstick$target)
+  moon_res_list
+}
 
-for(ligand in ligands)
-{
-  print(ligand)
-  moon_res_df_long_yarstick_sub <- moon_res_df_long_yarstick[moon_res_df_long_yarstick$target == ligand,]
-  if(sum(as.numeric(as.character(moon_res_df_long_yarstick_sub$groundtruth))) == 0)
-  {
-    moon_res_df_long_yarstick <- moon_res_df_long_yarstick[!(moon_res_df_long_yarstick$target == ligand),]
+moon_experiment_ids <- function(moon_res_list) {
+  vapply(moon_res_list, function(x) names(x)[2], character(1))
+}
+
+save_panel <- function(plot, filename, width, height) {
+  if (WRITE_FIGURES) {
+    ggplot2::ggsave(
+      filename = file.path(FIGURE_DIR, filename),
+      plot = plot,
+      width = width,
+      height = height,
+      units = "in"
+    )
+  }
+
+  invisible(plot)
+}
+
+
+# ------------------------------------------------------------------------------
+# Figure 2A: applied-ligand MOON scores
+# ------------------------------------------------------------------------------
+
+read_applied_ligand_table <- function(snapshot = SNAPSHOT) {
+  ligand_table <- as.data.frame(
+    readr::read_csv(snapshot$ligand_table, show_col_types = FALSE)
+  )
+
+  if (!snapshot$ligand_summary_col %in% names(ligand_table)) {
+    stop("Missing expected summary column '", snapshot$ligand_summary_col,
+         "' in ", snapshot$ligand_table)
+  }
+
+  ligand_table$summary_score <- ligand_table[[snapshot$ligand_summary_col]]
+
+  ligand_table <- ligand_table[!is.na(ligand_table$id), , drop = FALSE]
+  ligand_table$id <- as.character(ligand_table$id)
+  ligand_table$source <- as.character(ligand_table$source)
+  ligand_table
+}
+
+lookup_level_from_cache <- function(ligand_table, moon_res_list) {
+  if ("level" %in% names(ligand_table)) {
+    return(ligand_table)
+  }
+
+  ids <- moon_experiment_ids(moon_res_list)
+  cache_index <- setNames(seq_along(ids), ids)
+
+  ligand_table$level <- mapply(
+    FUN = function(experiment_id, ligand) {
+      cache_position <- unname(cache_index[experiment_id])
+
+      if (length(cache_position) == 0 || is.na(cache_position)) {
+        return(NA_integer_)
+      }
+
+      moon_df <- moon_res_list[[cache_position]]
+      rows <- which(moon_df$source_original == ligand & moon_df$level != 0)
+
+      if (length(rows) == 0) {
+        return(NA_integer_)
+      }
+
+      as.integer(moon_df$level[rows[1]])
+    },
+    experiment_id = ligand_table$id,
+    ligand = ligand_table$source
+  )
+
+  ligand_table
+}
+
+prepare_panel_2a_data <- function(ligand_table, moon_res_list) {
+  panel_data <- lookup_level_from_cache(ligand_table, moon_res_list)
+  panel_data <- panel_data[!is.na(panel_data$score), , drop = FALSE]
+
+  panel_data <- panel_data %>%
+    group_by(.data$source) %>%
+    mutate(
+      mean_ligand_score = mean(.data$score, na.rm = TRUE),
+      sd_ligand_score = sd(.data$score, na.rm = TRUE)
+    ) %>%
+    ungroup()
+
+  panel_data$quality_colour <- ifelse(
+    panel_data$summary_score > 1.7,
+    "lightgreen",
+    ifelse(panel_data$summary_score > 0.3, "orange", "red")
+  )
+
+  panel_data <- panel_data[order(panel_data$summary_score, decreasing = TRUE), ]
+  panel_data$source <- factor(panel_data$source, levels = unique(panel_data$source))
+  panel_data$level <- as.factor(panel_data$level)
+  panel_data
+}
+
+plot_panel_2a <- function(panel_data) {
+  ggplot(panel_data, aes(x = .data$source, y = .data$score, group = .data$source)) +
+    geom_boxplot(
+      aes(fill = .data$quality_colour),
+      coef = 6,
+      color = "black",
+      alpha = 1,
+      outlier.shape = NA
+    ) +
+    geom_jitter(aes(color = .data$level), width = 0.2, height = 0, alpha = 0.8) +
+    geom_hline(yintercept = 0) +
+    scale_fill_identity() +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = NULL, y = "MOON score", color = "Level")
+}
+
+
+# ------------------------------------------------------------------------------
+# Figure 2B: true-treatment versus background quantile/score
+# ------------------------------------------------------------------------------
+
+build_score_matrix <- function(moon_res_list) {
+  ids <- moon_experiment_ids(moon_res_list)
+  sources <- unique(unlist(lapply(moon_res_list, function(moon_df) {
+    moon_df$source_original[moon_df$level != 0]
+  }), use.names = FALSE))
+
+  score_matrix <- matrix(
+    NA_real_,
+    nrow = length(sources),
+    ncol = length(ids),
+    dimnames = list(sources, ids)
+  )
+
+  for (i in seq_along(moon_res_list)) {
+    moon_df <- moon_res_list[[i]]
+    keep <- moon_df$level != 0
+    score_matrix[moon_df$source_original[keep], i] <- as.numeric(moon_df[[2]][keep])
+  }
+
+  score_matrix
+}
+
+rank_by_experiment <- function(score_matrix) {
+  apply(score_matrix, 2, function(scores) {
+    rank(scores, na.last = "keep") / sum(!is.na(scores))
+  })
+}
+
+build_panel_2b_summary <- function(score_matrix, applied_ligand_table) {
+  rank_matrix <- rank_by_experiment(score_matrix)
+  ligands <- unique(as.character(applied_ligand_table$source))
+
+  ligand_summary <- lapply(ligands, function(ligand) {
+    true_experiments <- unique(applied_ligand_table$id[applied_ligand_table$source == ligand])
+    true_experiments <- intersect(true_experiments, colnames(score_matrix))
+    false_experiments <- setdiff(colnames(score_matrix), true_experiments)
+
+    if (!ligand %in% rownames(score_matrix)) {
+      return(data.frame(
+        ligand_to_rank = ligand,
+        mean_quantile_in_trueExp = NA_real_,
+        mean_quantile_in_falseExp = NA_real_,
+        mean_score_in_trueExp = NA_real_,
+        mean_score_in_falseExp = NA_real_
+      ))
+    }
+
+    data.frame(
+      ligand_to_rank = ligand,
+      mean_quantile_in_trueExp = mean(rank_matrix[ligand, true_experiments], na.rm = TRUE),
+      mean_quantile_in_falseExp = mean(rank_matrix[ligand, false_experiments], na.rm = TRUE),
+      mean_score_in_trueExp = mean(score_matrix[ligand, true_experiments], na.rm = TRUE),
+      mean_score_in_falseExp = mean(score_matrix[ligand, false_experiments], na.rm = TRUE)
+    )
+  })
+
+  bind_rows(ligand_summary)
+}
+
+plot_panel_2b_quantiles <- function(panel_2b_summary) {
+  plot_data <- reshape2::melt(
+    panel_2b_summary[order(panel_2b_summary$mean_score_in_trueExp, decreasing = FALSE),
+                     c("ligand_to_rank",
+                       "mean_quantile_in_trueExp",
+                       "mean_quantile_in_falseExp")],
+    id.vars = "ligand_to_rank"
+  )
+  plot_data$ligand_to_rank <- factor(plot_data$ligand_to_rank,
+                                     levels = unique(plot_data$ligand_to_rank))
+
+  ggplot(plot_data, aes(x = .data$value, y = .data$ligand_to_rank, color = .data$variable)) +
+    geom_point(size = 3) +
+    theme_minimal() +
+    labs(x = "Mean score quantile", y = NULL, color = NULL)
+}
+
+plot_panel_2b_scores <- function(panel_2b_summary) {
+  plot_data <- reshape2::melt(
+    panel_2b_summary[order(panel_2b_summary$mean_score_in_trueExp, decreasing = FALSE),
+                     c("ligand_to_rank",
+                       "mean_score_in_trueExp",
+                       "mean_score_in_falseExp")],
+    id.vars = "ligand_to_rank"
+  )
+  plot_data$ligand_to_rank <- factor(plot_data$ligand_to_rank,
+                                     levels = unique(plot_data$ligand_to_rank))
+
+  ggplot(plot_data, aes(x = .data$value, y = .data$ligand_to_rank, color = .data$variable)) +
+    geom_point(size = 3) +
+    theme_minimal() +
+    labs(x = "Mean MOON score", y = NULL, color = NULL)
+}
+
+
+# ------------------------------------------------------------------------------
+# Figure 2C: scoring-network characteristics
+# ------------------------------------------------------------------------------
+
+load_scoring_network_characteristics <- function(
+    path = SNAPSHOT$scoring_network_characteristics) {
+  if (is.na(path)) {
+    return(NULL)
+  }
+
+  load_single_rdata_object(path)
+}
+
+summarise_scoring_network_characteristics <- function(characteristics) {
+  as.data.frame(sapply(characteristics[c("nedges", "nnodes", "nTFs")], unlist))
+}
+
+plot_panel_2c_boxplots <- function(characteristics_df) {
+  plot_data <- reshape2::melt(
+    characteristics_df,
+    measure.vars = names(characteristics_df),
+    variable.name = "variable",
+    value.name = "value"
+  )
+
+  ggplot(plot_data, aes(x = .data$variable, y = .data$value)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.5) +
+    geom_jitter(width = 0.2, height = 0, alpha = 0.5) +
+    facet_wrap(~variable, scales = "free", nrow = 1) +
+    theme_minimal() +
+    labs(
+      title = "Moon scoring network characteristics",
+      x = NULL,
+      y = "Count"
+    )
+}
+
+plot_panel_2c_scatter <- function(characteristics_df, include_marginals = WRITE_FIGURES) {
+  base_plot <- ggplot(characteristics_df, aes(x = .data$nedges,
+                                             y = .data$nnodes,
+                                             size = .data$nTFs / 10)) +
+    geom_point(alpha = 0.5) +
+    theme_minimal() +
+    labs(
+      title = "Moon scoring network characteristics",
+      x = "Number of edges",
+      y = "Number of nodes",
+      size = "TFs / 10"
+    )
+
+  if (!include_marginals) {
+    return(base_plot)
+  }
+
+  ggExtra::ggMarginal(base_plot, type = "density", fill = "lightgrey")
+}
+
+
+# ------------------------------------------------------------------------------
+# Figure 2D / Supplementary S2 network exports
+# ------------------------------------------------------------------------------
+
+export_moon_scoring_network <- function(experiment_id,
+                                        ligand,
+                                        zscores,
+                                        meta_network,
+                                        moon_res_list,
+                                        output_prefix,
+                                        keep_upstream_node_peers = FALSE) {
+  ids <- moon_experiment_ids(moon_res_list)
+  moon_res_experiment <- moon_res_list[[match(experiment_id, ids)]]
+
+  if (is.null(moon_res_experiment)) {
+    stop("Experiment not found in MOON cache: ", experiment_id)
+  }
+
+  expressed_genes <- zscores[, experiment_id, drop = FALSE]
+  expressed_genes <- expressed_genes[complete.cases(expressed_genes), , drop = FALSE]
+  expressed_genes <- setNames(expressed_genes[, 1], nm = row.names(expressed_genes))
+
+  moon_res_experiment <- moon_res_experiment[, c(4, 2, 3)]
+  names(moon_res_experiment) <- c("source", "score", "level")
+
+  meta_network_filtered <- cosmosR:::filter_pkn_expressed_genes(
+    expressed_genes_entrez = names(expressed_genes),
+    meta_network
+  )
+
+  moon_scoring_network <- get_moon_scoring_network(
+    upstream_node = ligand,
+    meta_network = meta_network_filtered,
+    moon_scores = moon_res_experiment,
+    keep_upstream_node_peers = keep_upstream_node_peers
+  )
+
+  names(moon_scoring_network$SIF)[2] <- "sign"
+  names(moon_scoring_network$ATT)[2] <- "moon_score"
+
+  readr::write_csv(moon_scoring_network$SIF, paste0(output_prefix, "_SIF.csv"))
+  readr::write_csv(moon_scoring_network$ATT, paste0(output_prefix, "_ATT.csv"))
+
+  invisible(moon_scoring_network)
+}
+
+export_panel_2d_networks <- function(zscores, meta_network, moon_res_list) {
+  examples <- data.frame(
+    panel = c("Figure2D", "Figure2D", "Figure2D", "SupplementaryS2", "SupplementaryS2"),
+    ligand = c("OSM", "IL6", "IL13", "TGFB1", "EGF"),
+    experiment_id = c(
+      "OSM@Condition:HCT116@GSE53295.MicroArray.GPL6480",
+      "IL6@Condition:HuH-7@E-MTAB-4570.MicroArray.HTA-2_0",
+      "IL13@Condition:Blood (PBMC)&Duration:24h@GSE79027.RNASeq.SRP071332_GRCh38",
+      "TGFB1@Condition:HaCat&Duration:2h@E-MTAB-265.MicroArray.log_rsn_normalized",
+      "EGF&Duration:60min@Condition:HCT116@GSE94374.RNASeq.SRP098688_GRCh38"
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  for (i in seq_len(nrow(examples))) {
+    output_prefix <- file.path(
+      "results",
+      paste(examples$panel[i], SNAPSHOT$label, examples$ligand[i], sep = "_")
+    )
+
+    export_moon_scoring_network(
+      experiment_id = examples$experiment_id[i],
+      ligand = examples$ligand[i],
+      zscores = zscores,
+      meta_network = meta_network,
+      moon_res_list = moon_res_list,
+      output_prefix = output_prefix,
+      keep_upstream_node_peers = FALSE
+    )
   }
 }
 
-ROC_per_ligand <- moon_res_df_long_yarstick %>% as_tibble() %>% group_by(target) %>% roc_auc(groundtruth, score)
 
-experiment_count <- unique(moon_res_df_long_yarstick[,c(1,4)])
-experiment_count <- merge(experiment_count,data.frame(table(experiment_count$target)), by.x = "target", by.y = "Var1")
-experiment_count <- unique(experiment_count[,c(1,3)])
+# ------------------------------------------------------------------------------
+# Optional original-vs-corrected comparison
+# ------------------------------------------------------------------------------
 
-ROC_per_ligand <- merge(ROC_per_ligand, experiment_count, by = "target")
+compare_snapshot_ligand_tables <- function() {
+  original <- as.data.frame(
+    readr::read_csv(SNAPSHOTS$paper_original$ligand_table, show_col_types = FALSE)
+  )
+  corrected <- as.data.frame(
+    readr::read_csv(SNAPSHOTS$corrected_20240319$ligand_table, show_col_types = FALSE)
+  )
 
-ggplot(ROC_per_ligand, aes(x = Freq, y = .estimate, label = target)) + 
-  geom_label_repel() +
-  geom_point() +
-  geom_hline(yintercept = 0.5) +
-  theme_minimal()
+  original_summary <- original %>%
+    group_by(.data$source) %>%
+    summarise(mean_score_original = mean(.data$score, na.rm = TRUE), .groups = "drop")
 
-ROC_per_ligand$Freq_binned <- as.character(floor(ROC_per_ligand$Freq / 20) * 20)
-ROC_per_ligand <- ROC_per_ligand[order(ROC_per_ligand$Freq, decreasing = T),]
-ROC_per_ligand$target <- factor(ROC_per_ligand$target, level = ROC_per_ligand$target)
+  corrected_summary <- corrected %>%
+    group_by(.data$source) %>%
+    summarise(mean_score_corrected_20240319 = mean(.data$score, na.rm = TRUE),
+              .groups = "drop")
 
-ggplot(ROC_per_ligand, aes(x = target, y = .estimate, fill = Freq_binned)) + 
-  geom_bar(stat = "identity", position = "dodge") +
-  geom_hline(yintercept = 0.5) +
-  theme_minimal() + 
-  geom_text(aes(label=Freq), position=position_dodge(width=0.9), vjust=-0.25) +
-  theme(axis.text.x=element_text(angle=45, hjust=1)) 
+  comparison <- full_join(original_summary, corrected_summary, by = "source") %>%
+    mutate(delta_corrected_minus_original =
+             .data$mean_score_corrected_20240319 - .data$mean_score_original) %>%
+    arrange(desc(abs(.data$delta_corrected_minus_original)))
 
-ligands_of_interest <- as.character(ROC_per_ligand[ROC_per_ligand$Freq > 6 & ROC_per_ligand$.estimate < 0.55,"target"])
-
-moon_res_df_long_yarstick_receptors <- moon_res_df_long_yarstick[moon_res_df_long_yarstick$target %in% ligands_of_interest,]
-receptors_to_merge <- meta_network[meta_network$source %in%ligands_of_interest,]
-names(receptors_to_merge) <- c("target","sign","receptor")
-moon_res_df_long_yarstick_receptors <- merge(moon_res_df_long_yarstick_receptors, receptors_to_merge, by = "target")
-moon_res_df_long_yarstick_receptors$groundtruth <- as.numeric(moon_res_df_long_yarstick_receptors$source == moon_res_df_long_yarstick_receptors$target | moon_res_df_long_yarstick_receptors$source == moon_res_df_long_yarstick_receptors$receptor)
-moon_res_df_long_yarstick_receptors$groundtruth <- factor(moon_res_df_long_yarstick_receptors$groundtruth, levels = c(1,0))
-moon_res_df_long_yarstick_receptors[moon_res_df_long_yarstick_receptors$source == moon_res_df_long_yarstick_receptors$receptor,"score"] <- moon_res_df_long_yarstick_receptors[moon_res_df_long_yarstick_receptors$source == moon_res_df_long_yarstick_receptors$receptor,"score"] * moon_res_df_long_yarstick_receptors[moon_res_df_long_yarstick_receptors$source == moon_res_df_long_yarstick_receptors$receptor,"sign"]
-
-ROC_per_receptor <- moon_res_df_long_yarstick_receptors %>% as_tibble() %>% group_by(receptor) %>% roc_auc(groundtruth, score)
-
-experiment_count <- unique(moon_res_df_long_yarstick_receptors[,c(2,7)])
-experiment_count <- merge(experiment_count,data.frame(table(experiment_count$receptor)), by.x = "receptor", by.y = "Var1")
-experiment_count <- unique(experiment_count[,c(1,3)])
-
-ROC_per_receptor <- merge(ROC_per_receptor, experiment_count, by = "receptor")
-ROC_per_receptor <- merge(ROC_per_receptor, receptors_to_merge, by = "receptor",)
-
-# ggplot(ROC_per_receptor, aes(x = Freq, y = .estimate, label = target)) + 
-#   geom_label_repel() +
-#   geom_point() +
-#   geom_hline(yintercept = 0.5) +
-#   theme_minimal()
-
-ROC_per_receptor$Freq_binned <- as.character(floor(ROC_per_receptor$Freq / 20) * 20)
-ROC_per_receptor <- ROC_per_receptor[order(ROC_per_receptor$Freq, decreasing = T),]
-ROC_per_receptor$receptor <- factor(ROC_per_receptor$receptor, level = ROC_per_receptor$receptor)
-
-ggplot(ROC_per_receptor, aes(x = receptor, y = .estimate, fill = target, group = target)) + 
-  geom_bar(stat = "identity", position = "dodge") +
-  geom_hline(yintercept = 0.5) +
-  theme_minimal() + 
-  geom_text(aes(label=Freq), position=position_dodge(width=0.9), vjust=-0.25) +
-  theme(axis.text.x=element_text(angle=45, hjust=1)) +
-  ylim(c(0,1))
-
-
-#I should make networks connecting e.g. FGF10 to downstream TF to show why the estimation is so poor.
-#Will make such network for a few interesting cases.
-
-
-moon_res_df_long_target_only <- moon_res_df_long[which(moon_res_df_long$source == moon_res_df_long$target),]
-
-#we can check for each ligand how well they are scored (the higher the better)
-ggplot(moon_res_df_long_target_only, aes(x = source, y = score, group = source)) + 
-  geom_boxplot() + 
-  geom_jitter() + 
-  theme_minimal() +
-  theme(axis.text.x=element_text(angle=45, hjust=1)) + geom_hline(yintercept = 1.7)
-  
-moon_res_df_long_target_only <- merge(moon_res_df_long_target_only, meta_data, by = "id")
-write_csv(moon_res_df_long_target_only, file = "results/moon_res_df_long_target_only.csv")
-
-#chatgpt cleaned up the time and added a mean score column
-moon_res_df_long_target_only_GPTcleanedup <- as.data.frame(
-  read_csv("results/moon_res_df_long_target_only_GPTcleanedup_withMeanScore.csv"))
-moon_res_df_long_target_only_GPTcleanedup <- moon_res_df_long_target_only_GPTcleanedup[!is.na(moon_res_df_long_target_only_GPTcleanedup$score),]
-moon_res_df_long_target_only_GPTcleanedup <- moon_res_df_long_target_only_GPTcleanedup[!is.na(moon_res_df_long_target_only_GPTcleanedup$id),]
-moon_res_df_long_target_only_GPTcleanedup$loghours <- log(moon_res_df_long_target_only_GPTcleanedup$inferred_time_all_conditions)
-moon_res_df_long_target_only_GPTcleanedup <- moon_res_df_long_target_only_GPTcleanedup[order(moon_res_df_long_target_only_GPTcleanedup$median_score_by_target, decreasing = T),]
-moon_res_df_long_target_only_GPTcleanedup$target <- factor(moon_res_df_long_target_only_GPTcleanedup$target, levels = unique(moon_res_df_long_target_only_GPTcleanedup$target))
-moon_res_df_long_target_only_GPTcleanedup$source <- factor(moon_res_df_long_target_only_GPTcleanedup$source, levels = unique(moon_res_df_long_target_only_GPTcleanedup$source))
-moon_res_df_long_target_only_GPTcleanedup$quality <- ifelse(moon_res_df_long_target_only_GPTcleanedup$median_score_by_target > 1.7, "lightgreen",
-                                                            ifelse(moon_res_df_long_target_only_GPTcleanedup$median_score_by_target > 0.3, "orange",
-                                                            "red"))
-
-quality_mapping <- unique(moon_res_df_long_target_only_GPTcleanedup[,c("source","quality")])
-quality_mapping <- quality_mapping[complete.cases(quality_mapping),]
-#we can also add some of the metadata as colors for example
-ggplot(moon_res_df_long_target_only_GPTcleanedup, aes(x = source, y = score, group = source, color = loghours, fill = platformType)) + 
-  geom_boxplot(fill = quality_mapping$quality, coef = 6) + 
-  geom_jitter() + 
-  theme_minimal() +
-  theme(axis.text.x=element_text(angle=45, hjust=1)) + geom_hline(yintercept = 0)
-
-moon_res_df_long_target_only_GPTcleanedup <- moon_res_df_long_target_only_GPTcleanedup %>%
-  group_by(source) %>%
-  mutate(mean_ligand_score = mean(score, na.rm = TRUE)) %>%
-  ungroup()
-moon_res_df_long_target_only_GPTcleanedup <- as.data.frame(moon_res_df_long_target_only_GPTcleanedup)
-
-sum(unique(moon_res_df_long_target_only_GPTcleanedup$mean_ligand_score) > 0)
-sum(unique(moon_res_df_long_target_only_GPTcleanedup$mean_ligand_score) < 0)
-
-moon_res_df_long_target_only_GPTcleanedup <- moon_res_df_long_target_only_GPTcleanedup %>%
-  group_by(source) %>%
-  mutate(sd_ligand_score = sd(score, na.rm = TRUE)) %>%
-  ungroup()
-moon_res_df_long_target_only_GPTcleanedup <- as.data.frame(moon_res_df_long_target_only_GPTcleanedup)
-
-
-#get the levels of the ligands
-moon_level_list_filtered <- lapply(moon_res_list, function(x){
-  sample <- names(x)[2]
-  x <- x[which(x$level != 0),c(4,3)]
-  x <- unique(x)
-  names(x)[2] <- sample
-return(x)})
-
-moon_level_df <- moon_level_list_filtered %>% reduce(full_join, by = "source_original")
-moon_level_df <- as.data.frame(moon_level_df)
-
-moon_level_df_long <- melt(moon_level_df)
-moon_level_df_long$target <- gsub("@.*","",moon_level_df_long$variable)
-
-moon_level_df_long$target <- sapply(moon_level_df_long$target, function(x, maping_vector){
-  return(maping_vector[x])
-},maping_vector = maping_vector)
-
-moon_level_df_long <- moon_level_df_long[,c(2,1,3,4)]
-
-names(moon_level_df_long) <- c("id", "source", "level", "target")
-moon_level_df_long$id <- as.character(moon_level_df_long$id)
-
-moon_level_df_long_reduced <- moon_level_df_long[which(moon_level_df_long$source %in% moon_res_df_long_target_only_GPTcleanedup$source),]
-
-moon_res_df_long_target_only_GPTcleanedup_level <- merge(moon_res_df_long_target_only_GPTcleanedup, moon_level_df_long_reduced, by = c("id","source","target"))
-moon_res_df_long_target_only_GPTcleanedup_level$level <- as.character(moon_res_df_long_target_only_GPTcleanedup_level$level)
-
-#for paper
-ggplot(moon_res_df_long_target_only_GPTcleanedup_level, aes(x = source, y = score, group = source, color = level)) + 
-  geom_boxplot(fill = quality_mapping$quality, coef = 6, color = "black", alpha = 1) + 
-  geom_jitter() + 
-  theme_minimal() +
-  theme(axis.text.x=element_text(angle=45, hjust=1)) + geom_hline(yintercept = 0)
-
-
-ggplot(moon_res_df_long_target_only_GPTcleanedup_level, aes(x = level, y = score)) + 
-  geom_boxplot(coef = 7) + geom_jitter(alpha = 0.3) + theme_minimal()
-
-for(level in unique(moon_res_df_long_target_only_GPTcleanedup_level$level))
-{
-  print(paste("level: ",level, sep = ""))
-  print(mean(moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$level == level, "score"]))
-  print(median(moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$level == level, "score"]))
-  print(sd(moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$level == level, "score"]))
-  print(length(moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$level == level, "score"]))
+  print(head(comparison, 20))
+  invisible(comparison)
 }
 
-cor.test(moon_res_df_long_target_only_GPTcleanedup_level$score, as.numeric(moon_res_df_long_target_only_GPTcleanedup_level$level), method = "kendall")
 
-moon_res_df_ranks <- moon_res_df
-moon_res_df_ranks[,-1] <- as.data.frame(apply(moon_res_df_ranks[,-1], 2, function(x){rank(as.numeric(x), na.last = "keep") / length(na.omit(x))}))
-##IFNA1
-ligand_to_rank <- "WNT3A"
-ligand_to_rank_samples <- moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$source == ligand_to_rank,"id"]
+# ------------------------------------------------------------------------------
+# Expensive recomputation path
+# ------------------------------------------------------------------------------
 
-mean(moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$target == ligand_to_rank,"score"])
-mean(as.numeric(moon_res_df[moon_res_df$source_original == ligand_to_rank,which(names(moon_res_df) %in% ligand_to_rank_samples)]), na.rm = T)
-mean(as.numeric(moon_res_df[moon_res_df$source_original == ligand_to_rank,-c(1,which(names(moon_res_df) %in% ligand_to_rank_samples))]), na.rm = T)
-plot(density(as.numeric(moon_res_df[moon_res_df$source_original == ligand_to_rank,-c(1,which(names(moon_res_df) %in% ligand_to_rank_samples))]), na.rm = T))
-#get the relative rank
-mean(as.numeric(moon_res_df_ranks[moon_res_df_ranks$source_original == ligand_to_rank,-c(1,which(names(moon_res_df_ranks) %in% ligand_to_rank_samples))]), na.rm = T)
-mean(as.numeric(moon_res_df_ranks[moon_res_df_ranks$source_original == ligand_to_rank,which(names(moon_res_df_ranks) %in% ligand_to_rank_samples)]), na.rm = T)
+recompute_tf_activities <- function(zscores, collectri,
+                                    output = "results/citosig_TF_activties.RData") {
+  TF_activities <- apply(zscores, 2, function(x, collectri) {
+    TF_act <- decoupleR::run_ulm(na.omit(x), network = collectri)
+    TF_act[, c(2, 4)]
+  }, collectri = collectri)
 
-##all ligands
-ligand_scores_benchamrk <- list()
-for(ligand_to_rank in unique(moon_res_df_long_target_only_GPTcleanedup_level$target))
-{
-  print(ligand_to_rank)
-  ligand_to_rank_samples <- moon_res_df_long_target_only_GPTcleanedup_level[moon_res_df_long_target_only_GPTcleanedup_level$source == ligand_to_rank,"id"]
-  mean_quantile_in_trueExp <- mean(as.numeric(moon_res_df_ranks[moon_res_df_ranks$source_original == ligand_to_rank,which(names(moon_res_df_ranks) %in% ligand_to_rank_samples)]), na.rm = T)
-  mean_quantile_in_falseExp <- mean(as.numeric(moon_res_df_ranks[moon_res_df_ranks$source_original == ligand_to_rank,-c(1,which(names(moon_res_df_ranks) %in% ligand_to_rank_samples))]), na.rm = T)
-  mean_score_in_trueExp <- mean(as.numeric(moon_res_df[moon_res_df$source_original == ligand_to_rank,which(names(moon_res_df) %in% ligand_to_rank_samples)]), na.rm = T)
-  mean_score_in_falseExp <- mean(as.numeric(moon_res_df[moon_res_df$source_original == ligand_to_rank,-c(1,which(names(moon_res_df) %in% ligand_to_rank_samples))]), na.rm = T)
-  ligand_scores_benchamrk[[ligand_to_rank]] <- c(ligand_to_rank, mean_quantile_in_trueExp, mean_quantile_in_falseExp, mean_score_in_trueExp, mean_score_in_falseExp)
+  for (i in seq_along(TF_activities)) {
+    names(TF_activities[[i]])[2] <- names(TF_activities)[i]
+  }
+
+  save(TF_activities, file = output)
+  invisible(TF_activities)
 }
 
-ligand_scores_benchamrk_df <- as.data.frame(do.call(rbind, ligand_scores_benchamrk))
-ligand_scores_benchamrk_df[,-1] <- as.data.frame(apply(ligand_scores_benchamrk_df[,-1], 2, as.numeric))
-names(ligand_scores_benchamrk_df) <- c("ligand_to_rank", "mean_quantile_in_trueExp", "mean_quantile_in_falseExp", "mean_score_in_trueExp", "mean_score_in_falseExp")
+load_or_recompute_tf_activities <- function(zscores, collectri) {
+  if (RECOMPUTE_TF) {
+    return(recompute_tf_activities(zscores, collectri))
+  }
 
-ggplot(ligand_scores_benchamrk_df, aes(x = mean_quantile_in_falseExp, y = mean_quantile_in_trueExp)) + geom_point() + theme_minimal() + ylim(c(0,1)) + xlim(c(0,1)) + geom_abline(intercept = 0)
-sum(ligand_scores_benchamrk_df$mean_quantile_in_trueExp > ligand_scores_benchamrk_df$mean_quantile_in_falseExp)
+  load_single_rdata_object("results/citosig_TF_activties.RData")
+}
 
-#ordered by scores
-ligand_quantiles_long <- melt(ligand_scores_benchamrk_df[order(ligand_scores_benchamrk_df[,4],decreasing = F),c(1,2,3)])
-ligand_quantiles_long$ligand_to_rank <- factor(ligand_quantiles_long$ligand_to_rank, levels = unique(ligand_quantiles_long$ligand_to_rank))
+run_moon_for_experiment <- function(experiment_id,
+                                    RNA_input,
+                                    TF_input,
+                                    meta_network,
+                                    collectri,
+                                    n_steps = 10) {
+  RNA_input <- RNA_input[!is.na(RNA_input)]
 
-ligand_score_long <- melt(ligand_scores_benchamrk_df[order(ligand_scores_benchamrk_df[,4],decreasing = F),c(1,4,5)])
-ligand_score_long$ligand_to_rank <- factor(ligand_score_long$ligand_to_rank, levels = unique(ligand_score_long$ligand_to_rank))
+  meta_network_filtered <- meta_network_cleanup(meta_network)
+  meta_network_filtered <- cosmosR:::filter_pkn_expressed_genes(
+    names(RNA_input),
+    meta_pkn = meta_network_filtered
+  )
 
-#good sup figure
-ggplot(ligand_quantiles_long, aes(x = value, y = ligand_to_rank, color = variable)) + geom_point(size = 3) + theme_minimal()
-ggplot(ligand_score_long, aes(x = value, y = ligand_to_rank, color = variable)) + geom_point(size = 3) + theme_minimal()
+  TF_input <- TF_input[!is.na(TF_input)]
+  TF_input_filtered <- cosmosR:::filter_input_nodes_not_in_pkn(
+    TF_input,
+    meta_network_filtered
+  )
+  meta_network_filtered <- cosmosR:::keep_observable_neighbours(
+    meta_network_filtered,
+    n_steps = n_steps,
+    observed_nodes = names(TF_input_filtered)
+  )
 
-#just chekc if platform or other variable has higher scores
-variable_regulon <- moon_res_df_long_target_only_GPTcleanedup[,c(1,9)]
-variable_regulon$mor <- 1
-names(variable_regulon) <- c("target","source","mor")
-measurments_variable <- moon_res_df_long_target_only_GPTcleanedup[,c(3),drop = F]
-row.names(measurments_variable) <- moon_res_df_long_target_only_GPTcleanedup$id
-result_ulm <- run_ulm(as.matrix(measurments_variable), variable_regulon, minsize = 1)
-# mean(moon_res_df_long_target_only_GPTcleanedup[moon_res_df_long_target_only_GPTcleanedup$platformType == "MicroArray",3])
-# mean(moon_res_df_long_target_only_GPTcleanedup[moon_res_df_long_target_only_GPTcleanedup$platformType == "RNASeq",3])
+  meta_network_compressed_list <- compress_same_children(
+    meta_network_filtered,
+    sig_input = c(0),
+    metab_input = TF_input_filtered
+  )
 
+  meta_network_compressed <- meta_network_cleanup(
+    meta_network_compressed_list$compressed_network
+  )
+  meta_network_compressed_to_run <- meta_network_compressed
 
-cor.test(moon_res_df_long_target_only_GPTcleanedup$score, moon_res_df_long_target_only_GPTcleanedup$loghours, method = "kendall")
-ggplot(moon_res_df_long_target_only_GPTcleanedup, aes(x = loghours, y = score)) + geom_jitter() +
-  geom_smooth(method='lm', formula= y~x) + theme_minimal() + geom_hline(yintercept = 0)
+  before <- 1
+  after <- 0
+  iteration <- 1
 
+  while (before != after && iteration < 10) {
+    before <- nrow(meta_network_compressed_to_run)
+    moon_res <- cosmosR::moon(
+      downstream_input = TF_input_filtered,
+      meta_network = meta_network_compressed_to_run,
+      n_layers = n_steps,
+      statistic = "ulm"
+    )
 
-##Let'S redo the ROC plot with a dataset ocnsistent with the previous one
-moon_res_df_long_yarstick_filtered <- moon_res_df_long_yarstick[moon_res_df_long_yarstick$id %in% unique(moon_res_df_long_target_only_GPTcleanedup$id),]
-ROC_per_ligand <- moon_res_df_long_yarstick_filtered %>% as_tibble() %>% group_by(target) %>% roc_auc(groundtruth, score)
+    meta_network_compressed_to_run <- filter_incohrent_TF_target(
+      moon_res,
+      collectri,
+      meta_network_compressed_to_run,
+      RNA_input
+    )
 
-experiment_count <- unique(moon_res_df_long_yarstick_filtered[,c(1,4)])
-experiment_count <- merge(experiment_count,data.frame(table(experiment_count$target)), by.x = "target", by.y = "Var1")
-experiment_count <- unique(experiment_count[,c(1,3)])
+    after <- nrow(meta_network_compressed_to_run)
+    iteration <- iteration + 1
+  }
 
-ROC_per_ligand <- merge(ROC_per_ligand, experiment_count, by = "target")
+  message(
+    experiment_id,
+    ": ",
+    ifelse(iteration < 10,
+           paste0("converged after ", iteration - 1, " iterations"),
+           paste0("interrupted after ", iteration, " iterations"))
+  )
 
-ggplot(ROC_per_ligand, aes(x = Freq, y = .estimate, label = target)) + 
-  geom_label_repel() +
-  geom_point() +
-  geom_hline(yintercept = 0.5) +
-  theme_minimal()
+  decompress_moon_result(
+    moon_res,
+    meta_network_compressed_list,
+    meta_network_compressed_to_run
+  )
+}
 
-ROC_per_ligand$Freq_binned <- as.character(floor(ROC_per_ligand$Freq / 20) * 20)
-ROC_per_ligand <- ROC_per_ligand[order(ROC_per_ligand$Freq, decreasing = T),]
-ROC_per_ligand$target <- factor(ROC_per_ligand$target, level = ROC_per_ligand$target)
+recompute_moon_cache <- function(zscores,
+                                 TF_activities,
+                                 meta_network,
+                                 collectri,
+                                 output = SNAPSHOT$moon_cache,
+                                 n_steps = 10) {
+  TF_activities_df <- TF_activities %>%
+    reduce(full_join, by = "source") %>%
+    as.data.frame()
 
-ggplot(ROC_per_ligand, aes(x = target, y = .estimate, fill = Freq_binned)) + 
-  geom_bar(stat = "identity", position = "dodge") +
-  # geom_hline(yintercept = 0.5) +
-  theme_minimal() + 
-  geom_text(aes(label=Freq), position=position_dodge(width=0.9), vjust=-0.25) +
-  theme(axis.text.x=element_text(angle=45, hjust=1)) + 
-  geom_hline(yintercept = 0.55) +  geom_hline(yintercept = 0.45)
+  moon_res_list <- vector("list", ncol(zscores))
 
-experiment_id <- "BMP4@Condition:embryonic stem cell@E-MEXP-1192.MicroArray.HG-U133_Plus_2"
-expressed_genes <- zscores[,experiment_id,drop = F]
-expressed_genes <- expressed_genes[complete.cases(expressed_genes),,drop = F]
-expressed_genes <- setNames(expressed_genes[,1], nm = row.names(expressed_genes))
+  for (experiment_number in seq_len(ncol(zscores))) {
+    experiment_id <- names(zscores)[experiment_number]
+    message("Running MOON for experiment ", experiment_number, "/", ncol(zscores),
+            ": ", experiment_id)
 
-moon_res_list_named <- moon_res_list
-names(moon_res_list_named) <- lapply(moon_res_list_named, function(x){return(names(x)[2])})
+    RNA_input <- zscores[, experiment_number]
+    names(RNA_input) <- row.names(zscores)
 
-moon_res_experiment <- moon_res_list_named[[experiment_id]] 
+    TF_input <- TF_activities_df[, experiment_number + 1]
+    names(TF_input) <- TF_activities_df[, 1]
 
-ligand <- as.character(
-  moon_res_df_long_target_only_GPTcleanedup[moon_res_df_long_target_only_GPTcleanedup$id == experiment_id,"source"])
+    moon_res <- run_moon_for_experiment(
+      experiment_id = experiment_id,
+      RNA_input = RNA_input,
+      TF_input = TF_input,
+      meta_network = meta_network,
+      collectri = collectri,
+      n_steps = n_steps
+    )
+    names(moon_res)[2] <- experiment_id
+    moon_res_list[[experiment_number]] <- moon_res
+  }
 
-n_steps <- moon_res_experiment[moon_res_experiment$source == ligand,"level"]
-
-meta_network_filtered <- cosmosR:::filter_pkn_expressed_genes(expressed_genes_entrez = names(expressed_genes), meta_network)
-
-#This function allow us to get the subnetowrk that yielded the ligand score
-moon_scoring_network <- get_moon_scoring_network(ligand, meta_network_filtered, moon_res_experiment, T)
-
-names(moon_scoring_network$SIF)[2] <- "sign"
-names(moon_scoring_network$ATT)[2] <- "moon_score"
-
-write_csv(moon_scoring_network$SIF, file = "results/networktest_SIF.csv")
-write_csv(moon_scoring_network$ATT, file = "results/networktest_ATT.csv")
-
-##generate al scoring networks in a loop
-experiments <- moon_res_df_long_target_only_GPTcleanedup_level[!duplicated(moon_res_df_long_target_only_GPTcleanedup_level$source),"id"]
-
-# moon_scoring_network_list <- list()
-# moon_scoring_network_nedges <- list()
-# moon_scoring_network_nnodes <- list()
-# moon_scoring_network_nTFs <- list()
-# for(i in 1:length(experiments))
-# {
-#   print(i)
-#   experiment_id <- experiments[i]
-#   expressed_genes <- zscores[,experiment_id,drop = F]
-#   expressed_genes <- expressed_genes[complete.cases(expressed_genes),,drop = F]
-#   expressed_genes <- setNames(expressed_genes[,1], nm = row.names(expressed_genes))
-#   
-#   moon_res_list_named <- moon_res_list
-#   names(moon_res_list_named) <- lapply(moon_res_list_named, function(x){return(names(x)[2])})
-#   
-#   moon_res_experiment <- moon_res_list_named[[experiment_id]] 
-#   moon_res_experiment <- moon_res_experiment[,c(4,2,3)]
-#   names(moon_res_experiment)[1] <- "source"
-#   
-#   ligand <- as.character(
-#     moon_res_df_long_target_only_GPTcleanedup[moon_res_df_long_target_only_GPTcleanedup$id == experiment_id,"source"])
-#   
-#   n_steps <- moon_res_experiment[moon_res_experiment$source == ligand,"level"]
-#   
-#   meta_network_filtered <- cosmosR:::filter_pkn_expressed_genes(expressed_genes_entrez = names(expressed_genes), meta_network)
-#   
-#   #This function allow us to get the subnetowrk that yielded the ligand score
-#   moon_scoring_network <- get_moon_scoring_network(ligand, meta_network_filtered, moon_res_experiment, keep_upstream_node_peers = F)
-#   
-#   names(moon_scoring_network$SIF)[2] <- "sign"
-#   names(moon_scoring_network$ATT)[2] <- "moon_score"
-#   moon_scoring_network_list[[i]] <- moon_scoring_network
-#   
-#   SIF <- moon_scoring_network$SIF
-#   ATT <- moon_scoring_network$ATT
-#   
-#   moon_scoring_network_nedges[[i]] <- length(SIF[,1])
-#   moon_scoring_network_nnodes[[i]] <- length(ATT[,1])
-#   moon_scoring_network_nTFs[[i]] <- length(ATT[ATT$source %in% collectri$source,1])
-# }
-# 
-# moon_scoring_network_characteristics <- list("networks" = moon_scoring_network_list,
-#                                              "nedges" = moon_scoring_network_nedges,
-#                                              "nnodes" = moon_scoring_network_nnodes,
-#                                              "nTFs" = moon_scoring_network_nTFs)
-# 
-# save(moon_scoring_network_characteristics, file = "results/moon_scoring_network_characteristics.RData")
-load("results/moon_scoring_network_characteristics.RData")
-moon_scoring_network_list <- moon_scoring_network_characteristics$networks
-moon_scoring_network_nedges <- moon_scoring_network_characteristics$nedges
-moon_scoring_network_nnodes <- moon_scoring_network_characteristics$nnodes
-moon_scoring_network_nTFs <- moon_scoring_network_characteristics$nTFs
-
-boxplot(unlist(moon_scoring_network_nedges))
-quantile(unlist(moon_scoring_network_nedges), 0.5)
-
-boxplot(unlist(moon_scoring_network_nnodes))
-quantile(unlist(moon_scoring_network_nnodes), 0.5)
-
-boxplot(unlist(moon_scoring_network_nTFs))
-quantile(unlist(moon_scoring_network_nTFs), 0.5)
-mean(unlist(moon_scoring_network_nTFs))
+  save(moon_res_list, file = output)
+  invisible(moon_res_list)
+}
 
 
-df <- as.data.frame(sapply(moon_scoring_network_characteristics[-1], unlist))
-df_long <- melt(df)
+# ------------------------------------------------------------------------------
+# Main workflow
+# ------------------------------------------------------------------------------
 
-ggplot(df_long, aes(x = variable, y = value)) +
-  geom_boxplot(outlier.shape = NA, alpha = 0.5) +
-  geom_jitter(width = 0.2, height = 0, alpha = 0.5) +
-  facet_wrap(~variable, scales = "free", nrow = 1) +
-  theme_minimal() +
-  labs(title = "Moon scoring network characteristics",
-       x = "Variables",
-       y = "Values")
+moon_res_list <- load_moon_cache()
+applied_ligands <- read_applied_ligand_table()
+panel_2a_data <- prepare_panel_2a_data(applied_ligands, moon_res_list)
 
-# Scatter plot using ggplot2
-p <- ggplot(df, aes(x = nedges, y = nnodes, size = nTFs/10)) +
-  geom_point(alpha = 0.5) +
-  theme_minimal() +
-  labs(title = "Moon scoring network characteristics")
+panel_2a_plot <- plot_panel_2a(panel_2a_data)
+save_panel(panel_2a_plot, "moon_scores_ranked.pdf", width = 12, height = 6)
 
-# Add marginal distributions
-p_with_marginals <- ggMarginal(p, type = "density", fill = "lightgrey")
-print(p_with_marginals)
+score_matrix <- build_score_matrix(moon_res_list)
+panel_2b_summary <- build_panel_2b_summary(score_matrix, panel_2a_data)
 
-#let's plot only ligand with experiements under 24h
-# ggplot(moon_res_df_long_target_only_GPTcleanedup[moon_res_df_long_target_only_GPTcleanedup$inferred_time_all_conditions <= 24,], aes(x = source, y = score, group = source)) + 
-#   geom_boxplot() + 
-#   geom_jitter() + 
-#   theme_minimal() +
-#   theme(axis.text.x=element_text(angle=45, hjust=1)) + geom_hline(yintercept = 1.7)
-# 
-# #let's try to order them by mean score
-# moon_res_df_long_target_only_GPTcleanedup_less_than_24h <- moon_res_df_long_target_only_GPTcleanedup[moon_res_df_long_target_only_GPTcleanedup$inferred_time_all_conditions <= 24,]
-# moon_res_df_long_target_only_GPTcleanedup_less_than_24h <- moon_res_df_long_target_only_GPTcleanedup_less_than_24h[!is.na(moon_res_df_long_target_only_GPTcleanedup_less_than_24h$loghours),]
-# moon_res_df_long_target_only_GPTcleanedup_less_than_24h$source <- as.character(moon_res_df_long_target_only_GPTcleanedup_less_than_24h$source)
-# moon_res_df_long_target_only_GPTcleanedup_less_than_24h <- moon_res_df_long_target_only_GPTcleanedup_less_than_24h[order(moon_res_df_long_target_only_GPTcleanedup_less_than_24h$mean_score_by_target, decreasing = T),]
-# moon_res_df_long_target_only_GPTcleanedup_less_than_24h$source <- factor(moon_res_df_long_target_only_GPTcleanedup_less_than_24h$source, levels = unique(moon_res_df_long_target_only_GPTcleanedup_less_than_24h$source))
-# 
-# ggplot(moon_res_df_long_target_only_GPTcleanedup_less_than_24h, aes(x = source, y = score, group = source)) + 
-#   geom_boxplot() + 
-#   geom_jitter() + 
-#   theme_minimal() +
-#   theme(axis.text.x=element_text(angle=45, hjust=1)) + geom_hline(yintercept = 1.7)
-# 
-# experiements_id_less_than_24h <- unique(moon_res_df_long_target_only_GPTcleanedup[moon_res_df_long_target_only_GPTcleanedup$inferred_time_all_conditions <= 24,"id"])
+panel_2b_quantiles_plot <- plot_panel_2b_quantiles(panel_2b_summary)
+save_panel(panel_2b_quantiles_plot, "ligand_quantiles_long.pdf", width = 7, height = 9)
 
+panel_2b_scores_plot <- plot_panel_2b_scores(panel_2b_summary)
+save_panel(panel_2b_scores_plot, "ligand_score_long.pdf", width = 7, height = 9)
 
-ligand <- "IL6"
+moon_scoring_network_characteristics <- load_scoring_network_characteristics()
+if (!is.null(moon_scoring_network_characteristics)) {
+  panel_2c_data <- summarise_scoring_network_characteristics(
+    moon_scoring_network_characteristics
+  )
 
-ligand_targets <- meta_network[meta_network$source == ligand,"target"]
-ligand_targets <- ligand_targets[ligand_targets %in% moon_res_df$source_original]
+  panel_2c_boxplot <- plot_panel_2c_boxplots(panel_2c_data)
+  save_panel(panel_2c_boxplot, "moon_scoring_network_characteristics.pdf",
+             width = 7, height = 4)
 
-moon_res_df_long_ligand_targets <- moon_res_df_long[which(moon_res_df_long$source %in% c(ligand,ligand_targets) & moon_res_df_long$target == ligand),]
+  panel_2c_scatter <- plot_panel_2c_scatter(panel_2c_data)
+  save_panel(panel_2c_scatter, "moon_scoring_network_characteristics_scatter.pdf",
+             width = 6, height = 5)
+} else {
+  message("Skipping Figure 2C for snapshot ", SNAPSHOT$label,
+          ": no matching scoring-network characteristic cache is configured.")
+}
 
-ggplot(moon_res_df_long_ligand_targets, aes(x = source, y = score, group = source)) + 
-  geom_boxplot() + 
-  geom_jitter() + 
-  theme_minimal() +
-  theme(axis.text.x=element_text(angle=45, hjust=1)) + geom_hline(yintercept = 1.7)
+message("Figure 2A ligands: ", length(unique(panel_2a_data$source)))
+message("Figure 2A ligand-score rows: ", nrow(panel_2a_data))
+message("Figure 2B ligands with higher true-experiment quantile: ",
+        sum(panel_2b_summary$mean_quantile_in_trueExp >
+              panel_2b_summary$mean_quantile_in_falseExp, na.rm = TRUE),
+        "/", nrow(panel_2b_summary))
+if (exists("panel_2c_data")) {
+  message("Figure 2C median edges/nodes/TFs: ",
+          paste(
+            c(
+              median(panel_2c_data$nedges, na.rm = TRUE),
+              median(panel_2c_data$nnodes, na.rm = TRUE),
+              median(panel_2c_data$nTFs, na.rm = TRUE)
+            ),
+            collapse = "/"
+          ))
+}
 
+if (COMPARE_CORRECTED) {
+  snapshot_comparison <- compare_snapshot_ligand_tables()
+}
 
+if (EXPORT_PANEL_D_NETWORKS) {
+  zscores <- read_zscore_matrix()
+  meta_network <- load_meta_network()
+  export_panel_2d_networks(zscores, meta_network, moon_res_list)
+}
 
+if (RECOMPUTE_TF || RECOMPUTE_MOON) {
+  zscores <- read_zscore_matrix()
+  collectri <- load_collectri()
+  meta_network <- load_meta_network()
 
+  network_nodes <- unique(c(meta_network$source, meta_network$target))
+  collectri <- collectri[collectri$source %in% network_nodes, ]
+  collectri <- collectri[collectri$target %in% row.names(zscores), ]
 
+  TF_activities <- load_or_recompute_tf_activities(zscores, collectri)
 
+  if (RECOMPUTE_MOON) {
+    moon_res_list <- recompute_moon_cache(
+      zscores = zscores,
+      TF_activities = TF_activities,
+      meta_network = meta_network,
+      collectri = collectri
+    )
+  }
+}
 
-
-
+if (RECOMPUTE_SCORING_NETWORKS) {
+  stop("RECOMPUTE_SCORING_NETWORKS is intentionally not automated here yet. ",
+       "Use export_panel_2d_networks() for paper examples, or port the legacy ",
+       "all-ligand scoring-network loop once the desired exemplar set is fixed.")
+}
